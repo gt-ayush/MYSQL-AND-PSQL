@@ -1539,4 +1539,113 @@ WHERE d.dept_name = 'IT'                           -- 🔻 selection pushed down
 | Indexing | B-tree default; unique/partial/multi-column variants; skip small/low-selectivity/write-hot tables |
 | Optimization | Parse → Analyze → Rewrite → Plan → Execute; cost + cardinality; EXPLAIN (ANALYZE); push σ/π down |
 
-<!-- CONTINUE -->
+---
+
+## 12. Practice Set
+
+### 🅰 2-mark questions
+
+**Q1. Define aggregate functions. Name any four.**
+✅ Functions that take a set of rows and return one summary value: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`. In PostgreSQL they ignore NULL inputs (except `COUNT(*)`, which counts rows).
+
+**Q2. What is a view? Why is it called virtual?**
+✅ A named stored query usable like a table. It stores no rows — every SELECT re-executes its defining query — hence "virtual". (Only materialized views store data.)
+
+**Q3. What is the difference between a correlated and a simple subquery?**
+✅ Simple: evaluated once, independent of the outer query. Correlated: references outer columns, so it is (conceptually) re-evaluated once per outer row — e.g. comparing each salary to its own department's average.
+
+**Q4. What is bucket overflow in static hashing?**
+✅ A condition where a bucket's primary pages are full and further keys must go to overflow (chained) pages, lengthening lookups. Handled by chaining, open addressing, reorganization, or dynamic hashing.
+
+**Q5. When does PostgreSQL treat a view as automatically updatable?**
+✅ When the view selects from a single table and uses no DISTINCT, GROUP BY, HAVING, LIMIT/OFFSET, set operations, aggregates, or window functions (and exposes required NOT NULL/key columns for INSERT).
+
+### 🅱 5-mark questions
+
+**Q6. Differentiate WHERE and HAVING with an example.**
+✅ WHERE filters rows before grouping (cannot use aggregates); HAVING filters groups after aggregation.
+`SELECT dept_id, SUM(salary) FROM employees WHERE salary > 50000 GROUP BY dept_id HAVING SUM(salary) > 150000;`
+→ WHERE drops Sara, Vijay and Neha's row; HAVING deletes dept 3's group (140000 ≤ 150000); result: dept 2 → 240000.
+
+**Q7. Compare UNION and UNION ALL with output counts on any example.**
+✅ With A = salaries > 70000 (4 rows) and B = dept 2 (4 rows): `UNION` removes duplicates → **5 rows**; `UNION ALL` concatenates → **8 rows**. Rules for both: same column count, compatible types. UNION ALL is faster (no dedup pass).
+
+**Q8. Compare ROW_NUMBER, RANK and DENSE_RANK with actual output.**
+✅ For salaries (90000, 85000, 75000, 75000, 55000, …):
+
+| emp_name | salary | ROW_NUMBER | RANK | DENSE_RANK |
+|---|---|---|---|---|
+| Aarav | 90000 | 1 | 1 | 1 |
+| Meera | 85000 | 2 | 2 | 2 |
+| Diya  | 75000 | 3 | 3 | 3 |
+| Kabir | 75000 | 4 | 3 | 3 |
+| Rohan | 55000 | 5 | 5 | 4 |
+
+ROW_NUMBER is always unique; RANK skips numbers after ties; DENSE_RANK has no gaps.
+
+**Q9. Explain static hashing vs extendible hashing.**
+✅ Static: fixed B buckets, `h(k) mod B`, overflow chains on collision-heavy data, reorganization needed to grow. Extendible: directory of 2^GD entries addressed by the last GD bits; overflowing bucket splits alone (local depth +1); directory doubles only when local depth = global depth. Example: with GD = 1 and buckets {4,6}, {5,7}, inserting 8 splits bucket A into A{4,8} and C{6}, giving a 4-entry directory where 01 and 11 still share bucket B.
+
+**Q10. Clustered vs non-clustered index. How does PostgreSQL differ from MySQL here?**
+✅ Clustered: rows physically stored in key order, one per table, leaf = data itself (MySQL InnoDB's PK). Non-clustered: separate structure storing key → row pointer, many allowed. PostgreSQL has **no** clustered indexes (heap tables); `CLUSTER table USING index` re-sorts data once and is not maintained afterwards.
+
+**Q11. Write relational algebra for: (a) names of IT employees, (b) employees in Mumbai earning above 60000.**
+✅ (a) π emp_name (σ dept_name='IT' (employees ⋈ departments)) → {Aarav, Diya, Kabir, Neha}
+(b) π emp_name (σ location='Mumbai' ∧ salary>60000 (employees ⋈ departments)) → {Meera}
+
+### 🅲 Lab / hands-on (write the query)
+
+**Q12. Find the second-highest salary.**
+```sql
+SELECT MAX(salary) AS second_highest              -- biggest value BELOW the overall maximum
+FROM employees
+WHERE salary < (SELECT MAX(salary)                -- inner query: overall max = 90000
+                FROM employees);
+```
+✅ Output: **85000**. (Window alternative: `DENSE_RANK() = 2` — handles NULLs and ties more predictably.)
+
+**Q13. List departments that have no employees.**
+```sql
+SELECT d.dept_name                                -- department to test
+FROM departments d
+WHERE NOT EXISTS (SELECT 1 FROM employees e       -- TRUE if no matching employee exists
+                  WHERE e.dept_id = d.dept_id);   -- correlated on the outer department
+```
+✅ Output: **Marketing**. (NOT IN would also work here, but breaks if the inner list contains NULL.)
+
+**Q14. Show the top earner of every department.**
+```sql
+SELECT emp_name, dept_id, salary                  -- final report columns
+FROM (SELECT emp_name, dept_id, salary,           -- inner query ranks salaries per department
+             RANK() OVER (PARTITION BY dept_id
+                          ORDER BY salary DESC NULLS LAST) AS r
+      FROM employees) AS t                        -- derived table must get an alias
+WHERE r = 1;                                      -- keep only each department's rank-1 row
+```
+✅ Output (4 rows): Aarav (2, 90000), Meera (3, 85000), Sara (1, 48000), Vijay (99, 30000).
+
+**Q15. Show each employee with a running total of their department's payroll (in joining order).**
+```sql
+SELECT emp_name, dept_id, salary,                             -- per-employee facts
+       SUM(salary) OVER (PARTITION BY dept_id                 -- restart total per department
+                         ORDER BY hire_date                   -- accumulate in joining order
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS dept_running
+FROM employees
+ORDER BY dept_id, hire_date;                                  -- tidy display
+```
+✅ Dept 2 by hire order: Aarav 90000 → Diya 165000 → Kabir 240000 → Neha 240000 (NULL adds nothing).
+
+**Q16. Find the 3rd-highest *distinct* salary using a window function.**
+```sql
+SELECT DISTINCT salary                            -- one row per salary level
+FROM (SELECT salary,
+             DENSE_RANK() OVER (ORDER BY salary DESC NULLS LAST) AS dr  -- levels 1,2,2,3,4…
+      FROM employees) AS t
+WHERE dr = 3;                                     -- third distinct level
+```
+✅ Output: **75000**. (DENSE_RANK gives distinct salary *levels*, so ties don't distort the count.)
+
+---
+
+🎉 **You made it!** Re-run the Section 0 script any time, paste any block into `psql`, and watch the expected outputs appear. Revise §11 the night before the exam, and attempt §12 under a 30-minute timer.
+
