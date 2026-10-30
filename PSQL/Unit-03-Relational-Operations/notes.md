@@ -1429,4 +1429,114 @@ Seq Scan on employees  (cost=0.00..1.10 rows=2 width=20)
 **Q4 (lab):** How would you verify whether an index is actually being used?
 ✅ `EXPLAIN` the typical query (look for `Index Scan using <name>`), and check `pg_stat_user_indexes.idx_scan` over time; `ANALYZE` first so the planner has fresh statistics.
 
+---
+
+## 10. Query Optimization
+
+📌 You write *what* you want; the planner decides *how*. Same SQL can have many execution plans — the optimizer picks the **cheapest** one.
+
+### 🔹 The 5 steps of query processing
+
+1. **Parse** — syntax check, SQL text → parse tree.
+2. **Analyze/Semantic check** — tables/columns exist? types valid? → query tree.
+3. **Rewrite** — expand views, apply rules, simplify expressions.
+4. **Plan / Optimize** — enumerate candidate plans, estimate each **cost**, pick the minimum.
+5. **Execute** — the executor walks the chosen plan tree and returns rows.
+
+### 🔹 Two measures: cost and cardinality
+
+- **Cost** — a unitless estimate (`cost=0.00..1.10` = startup..total). Defaults: sequential page read = 1.0, random page = 4.0, per-row CPU = 0.01 — tune `postgresql.conf` for your hardware.
+- **Cardinality (rows=…)** — estimated number of rows at each plan node, derived from statistics (via `ANALYZE`) and **selectivity** (e.g. `salary = 75000` on N rows → 1/N if unique). Wrong cardinality ⇒ wrong plan; hence `ANALYZE` after big data changes.
+
+### 🔹 EXPLAIN vs EXPLAIN ANALYZE
+
+```sql
+ANALYZE employees;                                                   -- feed the planner fresh statistics
+EXPLAIN SELECT emp_name FROM employees WHERE salary > 70000;         -- show the plan WITHOUT running it
+EXPLAIN ANALYZE SELECT emp_name FROM employees WHERE salary > 70000; -- RUN it and show real timings too
+```
+
+**Line-by-line walkthrough**
+
+- `EXPLAIN` = zero risk (planner only); `EXPLAIN ANALYZE` = actually executes — **never** bare-run it on INSERT/UPDATE/DELETE; wrap those in `BEGIN … ROLLBACK`.
+- Compare `rows=` (estimate) with `actual rows=` (truth): a big gap means stale statistics.
+- ✅ On our small table:
+
+```text
+Seq Scan on employees  (cost=0.00..1.10 rows=4 width=38) (actual time=0.012..0.014 rows=4 loops=1)
+  Filter: (salary > 70000)
+  Rows Removed by Filter: 4
+Planning Time: 0.08 ms
+Execution Time: 0.03 ms
+```
+
+- On a large indexed table the same query would instead show `Index Scan using idx_emp_salary … Index Cond: (salary > 70000)` — comparing these two plans is exactly how you justify an index.
+
+### 🔹 Join strategies the planner chooses between
+
+| Strategy | How | Best when |
+|---|---|---|
+| Nested Loop | for each outer row, probe inner | small outer, inner indexed |
+| Hash Join | build hash table on smaller input, probe with other | big unsorted inputs, equality |
+| Merge Join | sort both, zip through in order | both large & pre-sorted/indexed |
+
+### 🔹 Heuristic (rule-based) optimizations
+
+```sql
+SELECT e.emp_name, d.dept_name                     -- ✂ project early: only 2 columns flow upward
+FROM employees e
+JOIN departments d ON e.dept_id = d.dept_id
+WHERE d.dept_name = 'IT'                           -- 🔻 selection pushed down BEFORE the join
+  AND e.salary > 50000;                            -- 🔻 second filter also applied early
+```
+
+**Line-by-line walkthrough**
+
+- **Push selections down** (σ early): filter each table before joining — fewer rows to combine.
+- **Project early** (π early): drop unused columns before the join.
+- Join **already-reduced** inputs; never let a cartesian product appear accidentally.
+- Avoid `SELECT *`, keep statistics fresh, write sargable predicates (`salary > 50000` ✔, `UPPER(salary) > …` blocks index use).
+
+### 🎯 Questions
+
+**Q1 (2 marks): Difference between EXPLAIN and EXPLAIN ANALYZE?**
+✅ EXPLAIN only *estimates and displays* the plan; EXPLAIN ANALYZE *executes* the query and shows actual row counts and timings alongside estimates.
+
+**Q2 (2 marks): What are cost and cardinality?**
+✅ Cost = planner's unitless estimate of work per plan (startup..total). Cardinality = estimated rows at each node, computed from statistics and selectivity — the driver of plan choice.
+
+**Q3 (5 marks): Explain query processing steps.**
+✅ Parse (syntax) → Analyze (names/types) → Rewrite (views) → Plan/Optimize (cost all candidate plans, pick cheapest) → Execute.
+
+**Q4 (5 marks): State heuristic optimization rules.**
+✅ Perform selections as early as possible; perform projections early; join reduced inputs (avoid needless cartesian products); decompose conjunctive selections; keep statistics current; write sargable predicates.
+
+---
+
+## 11. Quick Revision Cheat Sheet
+
+| Topic | One-liner to remember |
+|---|---|
+| Aggregates | All skip NULLs except `COUNT(*)`; `AVG` divides by non-NULL count; SUM of all-NULL = NULL |
+| GROUP BY / HAVING | Pipeline: FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY; WHERE = rows, HAVING = groups |
+| INNER JOIN | Only matched pairs (7/8 here) |
+| LEFT / RIGHT / FULL | Keep the named side's orphans, pad with NULL (8 / 8 / 9 here) |
+| CROSS JOIN | No ON → rows₁ × rows₂ (32 here) |
+| SELF JOIN | Same table twice via aliases; NULL manager drops out of INNER |
+| NATURAL JOIN | Implicit ON for same-named columns — convenient, risky |
+| Non-equijoin | `ON e.salary BETWEEN g.low AND g.high` — any θ-condition |
+| UNION vs UNION ALL | Dedupe (5 rows) vs plain concat (8 rows); same col count + types |
+| INTERSECT / EXCEPT | Common rows / minus rows; Oracle: MINUS; ORDER BY only at the very end |
+| Views | Virtual table = stored query; updatable if single-table, no DISTINCT/GROUP/aggregates |
+| WITH CHECK OPTION | Writes must satisfy the view's WHERE, else ERROR |
+| Materialized view | Stores the result; `REFRESH MATERIALIZED VIEW` to update |
+| Subqueries | `=` → single row; `IN/ANY/ALL` → multi-row; correlated → per outer row; EXISTS = efficient anti-join tool |
+| Relational algebra | σ rows, π columns, ∪ ∩ −, ×, ⋈, ρ rename, ÷ "all of" (double NOT EXISTS) |
+| Window functions | `OVER` = aggregate without collapsing; RANK gaps, DENSE_RANK no gaps, ROW_NUMBER unique |
+| LAG / LEAD / NTILE | Previous / next row value; bucket-splitter — all need `OVER (ORDER BY …)` |
+| Hashing | `h(key)` → bucket; static = overflow chains; extendible = directory bits, split locally |
+| PG hash index | Equality only; B-tree preferred; hash join/aggregate reuse the idea |
+| Indexing | B-tree default; unique/partial/multi-column variants; skip small/low-selectivity/write-hot tables |
+| Optimization | Parse → Analyze → Rewrite → Plan → Execute; cost + cardinality; EXPLAIN (ANALYZE); push σ/π down |
+
 <!-- CONTINUE -->
